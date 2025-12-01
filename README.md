@@ -418,7 +418,7 @@ matplotlib>=3.4.0
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/options-pricing-engine.git
+git clone https://github.com/options-pricing-engine.git
 cd options-pricing-engine
 
 # Create virtual environment
@@ -440,7 +440,7 @@ cd deployment
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your settings
+# Edit .env with settings
 
 # Start all services
 docker-compose up -d
@@ -462,7 +462,7 @@ curl http://localhost:8080/health
 
 ### Base URL
 ```
-Production: https://api.yourdomain.com
+Production: https://api.domain.com
 Development: http://localhost:8080
 ```
 
