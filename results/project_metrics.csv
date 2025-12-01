@@ -1,0 +1,11 @@
+Metric,Value,Category
+FFT Pricing Speed,292.6 ms,Performance
+Monte Carlo Speed (100k paths),1082 ms,Performance
+Speed Improvement,4x,Performance
+Pricing Accuracy (vs analytical),99.8%,Accuracy
+Calibration Time (21 options),1439.6 sec,Calibration
+Calibration RMSE,< 0.5% of spot,Calibration
+Greeks Computation,2647.4 ms,Performance
+Full Price + Greeks,2940.0 ms,Performance
+Options per Second,3,Throughput
+Parameter Recovery Error,< 5%,Accuracy

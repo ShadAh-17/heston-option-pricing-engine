@@ -1,0 +1,143 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: options-pricing-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-options_pricing}
+      POSTGRES_USER: ${POSTGRES_USER:-pricing_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pricing_pass_123}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - pricing-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pricing_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: options-pricing-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - pricing-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Python Pricing Service
+  pricing-service:
+    build:
+      context: ..
+      dockerfile: services/pricing/Dockerfile
+    container_name: options-pricing-service
+    environment:
+      FLASK_ENV: ${FLASK_ENV:-production}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-options_pricing}
+      POSTGRES_USER: ${POSTGRES_USER:-pricing_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pricing_pass_123}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pricing-network
+    restart: unless-stopped
+
+  # Go REST API Gateway
+  api-gateway:
+    build:
+      context: ../api
+      dockerfile: Dockerfile
+    container_name: options-pricing-api
+    environment:
+      PORT: 8080
+      PRICING_SERVICE_URL: http://pricing-service:5000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-options_pricing}
+      POSTGRES_USER: ${POSTGRES_USER:-pricing_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pricing_pass_123}
+      ENABLE_METRICS: "true"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - pricing-service
+      - redis
+      - postgres
+    networks:
+      - pricing-network
+    restart: unless-stopped
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: options-pricing-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - pricing-network
+    restart: unless-stopped
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: options-pricing-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ../monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - pricing-network
+    restart: unless-stopped
+
+networks:
+  pricing-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
