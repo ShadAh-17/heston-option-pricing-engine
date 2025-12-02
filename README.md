@@ -196,102 +196,340 @@ sequenceDiagram
     end
 ```
 
-### FFT Pricing (Carr-Madan Method)
-
-The core pricing algorithm uses Fourier transform for speed:
-
-```mermaid
-flowchart TB
-    Start([Start: Price Option]) --> Model[Create Heston Model<br/>v0, κ, θ, σ, ρ]
-    
-    Model --> Grid[Setup FFT Grid<br/>N = 4096<br/>α = 1.5 dampening<br/>η = 0.25 spacing]
-    
-    Grid --> Char[Compute Characteristic Function<br/>φu = exp C·T·u + D·T·u·v0]
-    
-    Char --> Transform[Carr-Madan Transform<br/>ψv = e^-rT · φv-α+1·i / denominator]
-    
-    Transform --> FFT[Apply FFT<br/>O N log N complexity<br/>~5ms for N=4096]
-    
-    FFT --> Interp[Interpolate at log K<br/>Extract option price]
-    
-    Interp --> IV[Calculate Implied Vol<br/>Newton-Raphson iteration]
-    
-    IV --> End([Return: price, IV])
-    
-    style Start fill:#e1f5e1
-    style End fill:#e1f5e1
-    style FFT fill:#fff3cd
-    style Char fill:#cfe2ff
-```
-
-### Model Calibration Flow
+### Detailed FFT Pricing Flow
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant Gateway as Go API
+    participant API as API Gateway
     participant Python as Python Service
-    participant Calibrator
-    participant Optimizer as SciPy Optimizer
+    participant Model as HestonModel
+    participant Pricer as HestonPricerFFT
+    participant Utils as Utils
 
-    Client->>Gateway: POST /api/v1/calibrate
-    Note over Client,Gateway: Market Data:<br/>• strikes: [90,95,100,105,110]<br/>• maturities: [0.25,0.5,1.0]<br/>• market_prices: [...]
+    API->>Python: POST /api/v1/price (method: fft)
     
-    Gateway->>Python: Forward Request
+    Python->>Model: __init__(v0, kappa, theta, sigma, rho)
+    Model-->>Python: model instance
     
-    Python->>Calibrator: calibrate(market_data)
+    Python->>Pricer: __init__(model, r, q)
+    Pricer-->>Python: pricer instance
     
-    Calibrator->>Calibrator: Define Objective Function
-    Note over Calibrator: minimize Σ market_iv - model_iv²<br/>subject to constraints
+    Python->>Pricer: price(S0, K, T, option_type)
     
-    Calibrator->>Optimizer: Differential Evolution
-    Note over Optimizer: Stage 1: Global Search<br/>• Population: 15×5=75<br/>• Generations: ~100<br/>• Explores parameter space
+    Pricer->>Pricer: Setup FFT Grid
+    Note over Pricer: N = 4096<br/>alpha = 1.5<br/>eta = 0.25
     
-    Optimizer->>Optimizer: Evaluate Fitness
-    Note over Optimizer: For each candidate:<br/>1. Price all options<br/>2. Calculate RMSE
+    Pricer->>Model: characteristic_function(u, T, r, q)
+    Note over Model: φ(u) = exp{C(T,u) + D(T,u)v₀}
+    Model-->>Pricer: phi values
     
-    Optimizer-->>Calibrator: Best Global Solution
+    Pricer->>Pricer: Carr-Madan Transform
+    Note over Pricer: ψ(v) = e^(-rT) φ(v-(α+1)i) / (α²+α-v²+i(2α+1)v)
     
-    Calibrator->>Optimizer: L-BFGS-B Refinement
-    Note over Optimizer: Stage 2: Local Polish<br/>• Gradient-based<br/>• Fine-tunes solution
+    Pricer->>Pricer: FFT Computation
+    Note over Pricer: FFT(ψ × simpson_weights)
     
-    Optimizer-->>Calibrator: Optimized Parameters
+    Pricer->>Pricer: Extract Strike Price
+    Note over Pricer: Interpolate at log(K)
     
-    Calibrator->>Calibrator: Validate Solution
-    Note over Calibrator: • Check Feller condition<br/>• Verify parameter bounds<br/>• Calculate fit metrics
+    Pricer-->>Python: price
     
-    Calibrator-->>Python: Calibration Result
-    Note over Calibrator,Python: {params: {v0, κ, θ, σ, ρ},<br/>rmse: 0.0032,<br/>success: true}
+    Python->>Utils: calculate_iv(price, S0, K, T, r, q, type)
+    Utils->>Utils: Newton-Raphson Iteration
+    Note over Utils: Target: BS(σ) = market_price
+    Utils-->>Python: implied_volatility
     
-    Python-->>Gateway: Response
-    Gateway-->>Client: Calibrated Model (2-3s)
+    Python-->>API: {price, iv, method: "fft", time_ms}
 ```
 
-### Greeks Calculation
+### Monte Carlo Pricing Flow
 
 ```mermaid
-flowchart LR
-    Start([Greeks Request]) --> Base[Calculate Base Price<br/>P₀ = price S₀, K, T]
+sequenceDiagram
+    participant API as API Gateway
+    participant Python as Python Service
+    participant Pricer as HestonPricerMC
+    participant NumPy as NumPy RNG
+
+    API->>Python: POST /api/v1/price (method: mc)
     
-    Base --> Par{Parallel Computation}
+    Python->>Pricer: price(S0, K, T, option_type, n_paths, n_steps)
     
-    Par --> Delta[Delta<br/>∂V/∂S<br/>bump S by 1.0]
-    Par --> Gamma[Gamma<br/>∂²V/∂S²<br/>second derivative]
-    Par --> Vega[Vega<br/>∂V/∂v<br/>bump v₀ by 0.01]
-    Par --> Theta[Theta<br/>∂V/∂t<br/>bump T by 1/365]
-    Par --> Rho[Rho<br/>∂V/∂r<br/>bump r by 0.01]
+    Pricer->>NumPy: Generate Random Numbers
+    Note over NumPy: W_S, W_v ~ N(0,1)<br/>Size: (n_paths, n_steps)
+    NumPy-->>Pricer: random_normals
     
-    Delta --> Collect[Collect Results]
-    Gamma --> Collect
-    Vega --> Collect
-    Theta --> Collect
-    Rho --> Collect
+    Pricer->>Pricer: Apply Correlation
+    Note over Pricer: W_v = ρ·W_S + √(1-ρ²)·W_v
     
-    Collect --> Return([Return All Greeks<br/>~25ms total])
+    loop Euler-Maruyama Discretization
+        Pricer->>Pricer: Update Variance
+        Note over Pricer: v_{t+dt} = v_t + κ(θ-v_t)dt + σ√(v_t)W_v√dt
+        
+        Pricer->>Pricer: Update Stock Price
+        Note over Pricer: S_{t+dt} = S_t exp((r-q-v_t/2)dt + √(v_t)W_S√dt)
+    end
+    
+    Pricer->>Pricer: Calculate Payoffs
+    Note over Pricer: Call: max(S_T - K, 0)<br/>Put: max(K - S_T, 0)
+    
+    Pricer->>Pricer: Discount to Present
+    Note over Pricer: price = e^(-rT) × mean(payoffs)
+    
+    Pricer->>Pricer: Calculate Standard Error
+    Note over Pricer: SE = std(payoffs) / √n_paths
+    
+    Pricer-->>Python: {price, std_error, paths_used}
+    
+    Python-->>API: {price, method: "mc", time_ms}
+```
+
+---
+
+## 📊 Greeks Calculation Flow
+
+### Complete Greeks Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API Gateway
+    participant R as Redis
+    participant P as Python Service
+    participant G as GreeksCalculator
+
+    C->>A: POST /api/v1/greeks
+    
+    A->>A: Validate Request
+    
+    A->>R: GET greeks_cache_key
+    
+    alt Cache Hit
+        R-->>A: Cached Greeks
+        A-->>C: Response (1-2ms)
+    else Cache Miss
+        R-->>A: nil
+        
+        A->>P: POST /api/v1/greeks
+        
+        P->>P: Create Model & Pricer
+        
+        P->>G: calculate_all_greeks(model, pricer, S0, K, T, type)
+        
+        G->>G: Base Price
+        Note over G: P₀ = price(S₀, K, T)
+        
+        par Parallel Calculations
+            G->>G: Delta (∂V/∂S)
+            Note over G: δ = [P(S+h) - P(S-h)] / 2h<br/>h = 1.0
+            
+            G->>G: Gamma (∂²V/∂S²)
+            Note over G: Γ = [P(S+h) - 2P(S) + P(S-h)] / h²
+            
+            G->>G: Vega (∂V/∂σ)
+            Note over G: ν = [P(σ+h) - P(σ-h)] / 2h<br/>h = 0.01
+            
+            G->>G: Theta (∂V/∂t)
+            Note over G: Θ = [P(T-h) - P(T)] / h<br/>h = 1/365
+            
+            G->>G: Rho (∂V/∂r)
+            Note over G: ρ = [P(r+h) - P(r-h)] / 2h<br/>h = 0.01
+        end
+        
+        G->>G: Second-Order Greeks
+        Note over G: Vanna = ∂²V/∂S∂σ<br/>Volga = ∂²V/∂σ²
+        
+        G-->>P: all_greeks
+        
+        P-->>A: {price, greeks: {...}, time_ms}
+        
+        A->>R: SET greeks_cache_key (TTL: 300s)
+        
+        A-->>C: Response (10-20ms)
+    end
+```
+
+### Greeks Calculation Details
+
+```mermaid
+flowchart TB
+    Start([Start Greeks Calculation])
+    
+    Start --> BasePrice[Calculate Base Price<br/>P₀ = price S₀, K, T]
+    
+    BasePrice --> Delta{Calculate Delta}
+    Delta --> DeltaCalc[P S₀+1 - P S₀-1 / 2]
+    
+    BasePrice --> Gamma{Calculate Gamma}
+    Gamma --> GammaCalc[P S₀+1 - 2P₀ + P S₀-1 / 1²]
+    
+    BasePrice --> Vega{Calculate Vega}
+    Vega --> VegaStep1[Increase v₀ by 1%]
+    VegaStep1 --> VegaStep2[P v₀+0.01 - P v₀-0.01 / 0.02]
+    
+    BasePrice --> Theta{Calculate Theta}
+    Theta --> ThetaCalc[P T-1/365 - P T / 1/365]
+    
+    BasePrice --> Rho{Calculate Rho}
+    Rho --> RhoCalc[P r+0.01 - P r-0.01 / 0.02]
+    
+    DeltaCalc --> Combine
+    GammaCalc --> Combine
+    VegaStep2 --> Combine
+    ThetaCalc --> Combine
+    RhoCalc --> Combine
+    
+    Combine[Combine All Greeks]
+    
+    Combine --> SecondOrder{Second-Order?}
+    SecondOrder -->|Yes| Vanna[Calculate Vanna<br/>∂²V/∂S∂σ]
+    SecondOrder -->|Yes| Volga[Calculate Volga<br/>∂²V/∂σ²]
+    
+    Vanna --> Return
+    Volga --> Return
+    SecondOrder -->|No| Return
+    
+    Return([Return Greeks Dictionary])
     
     style Start fill:#e1f5e1
     style Return fill:#e1f5e1
-    style Par fill:#fff3cd
+    style BasePrice fill:#fff3cd
+    style Combine fill:#cfe2ff
+```
+
+---
+
+## 🎯 Model Calibration Flow
+
+### Two-Stage Optimization Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API Gateway
+    participant P as Python Service
+    participant Cal as HestonCalibrator
+    participant DE as Differential Evolution
+    participant LBFGS as L-BFGS-B
+    participant DB as PostgreSQL
+
+    C->>A: POST /api/v1/calibrate
+    Note over C,A: {spot, rate, dividend,<br/>market_data[]}
+    
+    A->>A: Validate Market Data
+    Note over A: Check: min 5 options<br/>strikes > 0, prices > 0
+    
+    A->>P: POST /api/v1/calibrate
+    
+    P->>Cal: __init__(spot, rate, dividend, market_data)
+    
+    Cal->>Cal: Define Objective Function
+    Note over Cal: RMSE(params) = √[Σ(model_price - market_price)²/N]
+    
+    P->>Cal: calibrate(method="two_stage")
+    
+    Cal->>DE: Stage 1: Global Search
+    Note over DE: Algorithm: Differential Evolution<br/>Population: 15×5=75<br/>Generations: 50<br/>Mutation: 0.8<br/>Crossover: 0.7
+    
+    loop Generation 1 to 50
+        DE->>DE: Mutate Population
+        DE->>DE: Crossover
+        DE->>Cal: Evaluate RMSE(candidate)
+        Cal->>Cal: Price All Options
+        Cal-->>DE: RMSE value
+        DE->>DE: Select Best
+    end
+    
+    DE-->>Cal: Best Global Parameters
+    Note over Cal: params_global<br/>RMSE ~ 0.05
+    
+    Cal->>LBFGS: Stage 2: Local Refinement
+    Note over LBFGS: Algorithm: L-BFGS-B<br/>Max iterations: 100<br/>Tolerance: 1e-6<br/>Initial: params_global
+    
+    loop Until Convergence
+        LBFGS->>Cal: Evaluate Gradient
+        Cal->>Cal: Numerical Gradient
+        Cal-->>LBFGS: ∇RMSE
+        LBFGS->>LBFGS: Update Parameters
+        LBFGS->>Cal: Check RMSE
+        Cal-->>LBFGS: Improved RMSE
+    end
+    
+    LBFGS-->>Cal: Refined Parameters
+    Note over Cal: params_final<br/>RMSE ~ 0.02
+    
+    Cal->>Cal: Calculate Metrics
+    Note over Cal: RMSE, MAE, Max Error, R²
+    
+    Cal-->>P: Calibration Result
+    Note over P: {success: true,<br/>params: {...},<br/>metrics: {...}}
+    
+    P-->>A: Calibration Result
+    
+    A->>DB: INSERT model_calibrations
+    Note over DB: Save parameters & metrics
+    
+    A-->>C: Response (1.5-3s)
+    Note over C,A: {parameters, metrics,<br/>calibration_time_ms}
+```
+
+---
+## 🌊 Volatility Surface Flow
+
+### Surface Generation Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API Gateway
+    participant P as Python Service
+    participant Pricer as HestonPricerFFT
+    participant Utils as Utils
+
+    C->>A: POST /api/v1/surface
+    Note over C,A: {spot, rate, dividend,<br/>params, strikes[], maturities[]}
+    
+    A->>A: Validate Inputs
+    Note over A: strikes: 5-20 points<br/>maturities: 2-10 points
+    
+    A->>P: POST /api/v1/surface
+    
+    P->>P: Create Heston Model
+    Note over P: model = HestonModel(v0, κ, θ, σ, ρ)
+    
+    P->>P: Create Pricer
+    Note over P: pricer = HestonPricerFFT(model, r, q)
+    
+    P->>P: Initialize Surface Matrix
+    Note over P: surface[K][T] = None<br/>size: len(strikes) × len(maturities)
+    
+    loop For each Maturity T
+        loop For each Strike K
+            P->>Pricer: price(S0, K, T, "call")
+            Pricer-->>P: call_price
+            
+            P->>Pricer: price(S0, K, T, "put")
+            Pricer-->>P: put_price
+            
+            P->>Utils: calculate_iv(call_price, ...)
+            Utils-->>P: call_iv
+            
+            P->>Utils: calculate_iv(put_price, ...)
+            Utils-->>P: put_iv
+            
+            P->>P: Store Point
+            Note over P: surface[K][T] = {<br/>  call_price, put_price,<br/>  call_iv, put_iv<br/>}
+        end
+    end
+    
+    P->>P: Flatten to Array
+    Note over P: Convert matrix to list of dicts
+    
+    P-->>A: Surface Data
+    Note over P,A: {surface: [...],<br/>points: N×M×2,<br/>time_ms}
+    
+    A-->>C: Response (100-300ms)
+    Note over C,A: Ready for 3D visualization
 ```
 
 ---
